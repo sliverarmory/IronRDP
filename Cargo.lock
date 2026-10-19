@@ -2694,6 +2694,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "ironrdp-capture-replay",
  "ironrdp-graphics",
  "ironrdp-pdu",
  "ironrdp-server",
