@@ -97,7 +97,7 @@ id = "no-nla-accepted"
 file = "rdp-no-nla-accepted1.pcapng"
 sha256 = "1146ef447ad88e58f25d14adf81581233c8265bf49140fa6f7a172fd30f3c402"
 intent = "RDP without NLA accepted by the server."
-benchmark = ["replay"]
+benchmark = ["replay", "connector"]
 
 [capture.expect]
 outcome = "partial"
@@ -115,6 +115,12 @@ gaps = 8
 fingerprint = "9043e81b889c74addc2f6fe80c55051f5acc95ad4514fc2f1f420b60b0a7e51b"
 gap_fingerprint = "1e55c2cd2be210a7f7533c1a28882d2ef18fe8bf307ae10f6fd663a6177feb65"
 
+[capture.connector]
+steps = 26
+outbound_frames = 17
+server_frames = 15
+fingerprint = "8af79c6f74bf493feb9c1d13104e03fb8eb3d78c59cb1a1112a1e57798c8f9e3"
+
 [[capture]]
 id = "no-nla-rejected"
 file = "rdp-no-nla-rejected1.pcapng"
@@ -130,7 +136,7 @@ id = "no-nla-smartcard"
 file = "rdp-no-nla-smartcard-auth1.pcapng"
 sha256 = "b29eedb9e81ed6fab7e0730951880e78fc60c3d64bfb6b37e4fa604ea3a30ff2"
 intent = "RDP without NLA using smartcard authentication."
-benchmark = ["replay"]
+benchmark = ["replay", "connector"]
 
 [capture.expect]
 outcome = "partial"
@@ -147,6 +153,12 @@ final_dimensions = [1024, 768]
 gaps = 8
 fingerprint = "51069cfd256a082e8bf9aa9d159ebc1c1d82c5f0bf7991f07d61bfa09eb81426"
 gap_fingerprint = "3f0d393761aa4f99d341dd4d05f045fceab15f46c819c79ca3911a897f0eddc3"
+
+[capture.connector]
+steps = 26
+outbound_frames = 17
+server_frames = 15
+fingerprint = "5a0b5318cf8d48b75cffbf68b464b1694f79e8c07bbb5e470832b54096b3da38"
 
 [[capture]]
 id = "no-tls-accepted"

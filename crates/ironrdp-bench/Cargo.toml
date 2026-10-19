@@ -23,7 +23,7 @@ qoiz = ["ironrdp/qoiz"]
 [dependencies]
 anyhow = "1" # public
 async-trait = "0.1"
-ironrdp = { path = "../ironrdp", features = ["server", "pdu", "__bench"] }
+ironrdp = { path = "../ironrdp", features = ["server", "pdu", "__bench", "connector", "svc"] }
 ironrdp-capture-replay.path = "../ironrdp-capture-replay" # public
 pico-args = "0.5"
 serde = { version = "1", features = ["derive"] } # public
