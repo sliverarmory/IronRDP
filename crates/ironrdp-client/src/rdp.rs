@@ -640,6 +640,7 @@ const DISPLAY_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(3);
 struct ResizeQueue {
     in_flight: Option<TimedResizeRequest>,
     pending: Option<TimedResizeRequest>,
+    last_sent: Option<ResizeRequest>,
 }
 
 impl ResizeQueue {
@@ -653,17 +654,46 @@ impl ResizeQueue {
     }
 
     fn defer(&mut self, request: ResizeRequest) {
+        // A duplicate of the in-flight request supersedes any older pending
+        // target, but must not schedule another identical monitor layout.
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.request == request)
+        {
+            self.pending = None;
+            return;
+        }
         self.pending = Some(TimedResizeRequest {
             request,
             deadline: tokio::time::Instant::now() + DISPLAY_CONTROL_READY_TIMEOUT,
         });
     }
 
-    fn mark_in_flight(&mut self, request: ResizeRequest) {
-        self.in_flight = Some(TimedResizeRequest {
+    fn already_applied(&self, request: ResizeRequest, width: u16, height: u16) -> bool {
+        self.in_flight.is_none()
+            && self.last_sent == Some(request)
+            && (request.width, request.height) == (width, height)
+    }
+
+    fn mark_sent(&mut self, request: ResizeRequest, width: u16, height: u16) {
+        self.last_sent = Some(request);
+        // Scale/physical-size-only updates still go to the server, but do not
+        // require a framebuffer change or a Deactivate All acknowledgment.
+        self.in_flight = ((request.width, request.height) != (width, height)).then(|| TimedResizeRequest {
             request,
             deadline: tokio::time::Instant::now() + DISPLAY_CONTROL_READY_TIMEOUT,
         });
+    }
+
+    fn observe_desktop_size(&mut self, width: u16, height: u16) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| (in_flight.request.width, in_flight.request.height) == (width, height))
+        {
+            self.completed();
+        }
     }
 
     fn completed(&mut self) {
@@ -700,6 +730,7 @@ pub struct RdpClient {
     close_receiver: watch::Receiver<bool>,
     graceful_close_receiver: watch::Receiver<bool>,
     auto_reconnect_maximum_attempts: Option<u32>,
+    display_resize_reconnect: bool,
     desktop_update_enabled: bool,
     desktop_limits: Option<(u16, u16, usize)>,
     #[cfg(feature = "clipboard-custom")]
@@ -726,6 +757,7 @@ impl RdpClient {
             close_receiver,
             graceful_close_receiver,
             auto_reconnect_maximum_attempts: None,
+            display_resize_reconnect: true,
             desktop_update_enabled: false,
             desktop_limits: None,
             #[cfg(feature = "clipboard-custom")]
@@ -767,6 +799,18 @@ impl RdpClient {
     #[must_use]
     pub fn with_auto_reconnect(mut self, maximum_attempts: u32) -> Self {
         self.auto_reconnect_maximum_attempts = Some(maximum_attempts);
+        self
+    }
+
+    /// Controls whether a failed dynamic display update establishes a new connection.
+    ///
+    /// Enabled by default for compatibility with standalone clients. Embedders
+    /// that require explicit reconnection can disable this: the client reports
+    /// [`RdpOutputEvent::DisplayResizeFallback`], then terminates without starting
+    /// another connection. This is independent of automatic transport recovery.
+    #[must_use]
+    pub fn with_display_resize_reconnect(mut self, enabled: bool) -> Self {
+        self.display_resize_reconnect = enabled;
         self
     }
 
@@ -1160,19 +1204,13 @@ impl RdpClient {
             .await
             {
                 Ok(RdpControlFlow::ReconnectWithNewSize { width, height, reason }) => {
-                    if !self
-                        .send_output_event(RdpOutputEvent::DisplayResizeFallback(reason))
-                        .await
-                    {
-                        self.emit_user_initiated_termination();
+                    if !self.handle_resize_fallback(width, height, reason).await {
                         break;
                     }
                     // A resize fallback intentionally establishes a new session, not an
                     // automatic reconnection to the old one.
                     auto_reconnect_cookie = None;
                     reconnect_attempt = 0;
-                    self.config.connector.desktop_size.width = width;
-                    self.config.connector.desktop_size.height = height;
                 }
                 Ok(RdpControlFlow::TerminatedGracefully(reason)) => {
                     if !self.send_output_event(RdpOutputEvent::Terminated(Ok(reason))).await {
@@ -1211,6 +1249,25 @@ impl RdpClient {
         send_cancellable_output_event(&self.output_event_sender, event, &mut self.close_receiver)
             .await
             .unwrap_or(false)
+    }
+
+    async fn handle_resize_fallback(&mut self, width: u16, height: u16, reason: DisplayResizeFallbackReason) -> bool {
+        if !self
+            .send_output_event(RdpOutputEvent::DisplayResizeFallback(reason))
+            .await
+        {
+            self.emit_user_initiated_termination();
+            return false;
+        }
+        if !self.display_resize_reconnect {
+            let _ = self
+                .send_output_event(RdpOutputEvent::Terminated(Ok(GracefulDisconnectReason::UserInitiated)))
+                .await;
+            return false;
+        }
+        self.config.connector.desktop_size.width = width;
+        self.config.connector.desktop_size.height = height;
+        true
     }
 
     async fn try_auto_reconnect(
@@ -3402,7 +3459,10 @@ async fn active_session(
                             scale_factor,
                             physical_size,
                         };
-                        if resize_queue.in_flight.is_some() || active_stage.display_control_ready() == Some(false) {
+                        if resize_queue.already_applied(request, image.width(), image.height()) {
+                            resize_queue.pending = None;
+                            ActiveSessionIteration::outputs(Vec::new())
+                        } else if resize_queue.in_flight.is_some() || active_stage.display_control_ready() == Some(false) {
                             resize_queue.defer(request);
                             ActiveSessionIteration::outputs(Vec::new())
                         } else if let Some(dvc_batch) = active_stage.prepare_resize(
@@ -3411,7 +3471,7 @@ async fn active_session(
                             Some(request.scale_factor),
                             request.physical_size,
                         ) {
-                            resize_queue.mark_in_flight(request);
+                            resize_queue.mark_sent(request, image.width(), image.height());
                             let mut outputs = Vec::new();
                             if let Some(messages) = active_stage
                                 .get_svc_processor_mut::<RailClient>()
@@ -4337,6 +4397,17 @@ async fn active_session(
             }
         }
 
+        // EGFX ResetGraphics can complete a display update without the classic
+        // Deactivation-Reactivation Sequence. Observe its actual framebuffer
+        // size before testing the timeout or dispatching a queued resize.
+        resize_queue.observe_desktop_size(image.width(), image.height());
+        if resize_queue
+            .pending
+            .as_ref()
+            .is_some_and(|pending| resize_queue.already_applied(pending.request, image.width(), image.height()))
+        {
+            resize_queue.pending = None;
+        }
         if resize_queue.in_flight.is_none()
             && let Some(pending) = resize_queue.pending.as_ref()
         {
@@ -4352,7 +4423,7 @@ async fn active_session(
                         )
                         .ok_or_else(|| ironrdp_session::general_err!("Display Control became unavailable"))??;
                     resize_queue.pending = None;
-                    resize_queue.mark_in_flight(request);
+                    resize_queue.mark_sent(request, image.width(), image.height());
                     let channel_id = batch.channel_id();
                     let messages = batch.into_messages();
                     #[cfg(feature = "udp")]
@@ -4787,7 +4858,7 @@ mod tests {
         let first = resize_request(1024, 768);
         let latest = resize_request(1600, 900);
         let mut queue = ResizeQueue::default();
-        queue.mark_in_flight(first);
+        queue.mark_sent(first, 800, 600);
         let deadline = queue.deadline().expect("in-flight resize must have a deadline");
         queue.defer(latest);
 
@@ -4812,6 +4883,126 @@ mod tests {
             queue.timed_out_request(deadline),
             Some((request, DisplayResizeFallbackReason::CapabilitiesTimedOut))
         );
+    }
+
+    #[test]
+    fn resize_queue_accepts_egfx_dimensions_without_reactivation() {
+        let request = resize_request(1600, 900);
+        let mut queue = ResizeQueue::default();
+        queue.mark_sent(request, 800, 600);
+        let deadline = queue.deadline().expect("a changed extent must have a deadline");
+
+        queue.observe_desktop_size(800, 600);
+        assert!(queue.in_flight.is_some(), "old frames do not complete a resize");
+        queue.observe_desktop_size(1600, 900);
+
+        assert!(queue.deadline().is_none());
+        assert_eq!(queue.timed_out_request(deadline), None);
+        assert!(queue.already_applied(request, 1600, 900));
+    }
+
+    #[test]
+    fn resize_queue_keeps_scale_updates_without_waiting_for_a_new_extent() {
+        let request = resize_request(1600, 900);
+        let mut queue = ResizeQueue::default();
+        assert!(!queue.already_applied(request, 1600, 900));
+        queue.mark_sent(request, 1600, 900);
+        assert!(queue.already_applied(request, 1600, 900));
+        assert!(queue.deadline().is_none());
+
+        let scaled = ResizeRequest {
+            scale_factor: 200,
+            ..request
+        };
+        assert!(
+            !queue.already_applied(scaled, 1600, 900),
+            "scale changes still need a monitor layout"
+        );
+        queue.mark_sent(scaled, 1600, 900);
+        assert!(queue.already_applied(scaled, 1600, 900));
+        assert!(
+            queue.deadline().is_none(),
+            "scale-only changes do not require reactivation"
+        );
+
+        let physical = ResizeRequest {
+            physical_size: Some((500, 300)),
+            ..scaled
+        };
+        assert!(!queue.already_applied(physical, 1600, 900));
+    }
+
+    #[test]
+    fn resize_queue_drops_duplicate_pending_layout_after_graphics_completion() {
+        let request = resize_request(1600, 900);
+        let mut queue = ResizeQueue::default();
+        queue.mark_sent(request, 800, 600);
+        queue.defer(resize_request(1920, 1080));
+        queue.defer(request);
+        assert!(queue.pending.is_none(), "latest target matches the in-flight request");
+        queue.observe_desktop_size(1600, 900);
+        assert!(
+            queue.deadline().is_none(),
+            "no duplicate layout can start a new timeout"
+        );
+    }
+
+    fn resize_test_client(output: crate::output_channel::OutputEventSender) -> RdpClient {
+        let config = crate::config::ConfigBuilder::new()
+            .with_destination(crate::config::Destination::from_parts("127.0.0.1", 3389))
+            .with_username("user")
+            .with_password("password")
+            .with_client_build(1)
+            .with_client_dir(r"C:\")
+            .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::WINDOWS)
+            .with_client_name("client")
+            .with_desktop_width(800)
+            .with_desktop_height(600)
+            .build()
+            .expect("test configuration should build");
+        RdpClient::new(config, output)
+    }
+
+    #[tokio::test]
+    async fn resize_fallback_opt_out_terminates_before_a_new_connection() {
+        for reason in [
+            DisplayResizeFallbackReason::DisplayControlUnavailable,
+            DisplayResizeFallbackReason::CapabilitiesTimedOut,
+            DisplayResizeFallbackReason::ReactivationTimedOut,
+        ] {
+            let (output, mut receiver) = crate::output_channel::output_channel(2);
+            let mut client = resize_test_client(output).with_display_resize_reconnect(false);
+            assert!(!client.handle_resize_fallback(1600, 900, reason).await);
+            assert_eq!(client.config.connector.desktop_size.width, 800);
+            assert_eq!(client.config.connector.desktop_size.height, 600);
+            assert!(matches!(
+                receiver.recv().await,
+                Some(RdpOutputEvent::DisplayResizeFallback(actual)) if actual == reason
+            ));
+            assert!(matches!(
+                receiver.recv().await,
+                Some(RdpOutputEvent::Terminated(Ok(GracefulDisconnectReason::UserInitiated)))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_fallback_retains_default_reconnect_behavior() {
+        let (output, mut receiver) = crate::output_channel::output_channel(1);
+        let mut client = resize_test_client(output);
+        assert!(
+            client
+                .handle_resize_fallback(1600, 900, DisplayResizeFallbackReason::DisplayControlUnavailable)
+                .await
+        );
+        assert_eq!(client.config.connector.desktop_size.width, 1600);
+        assert_eq!(client.config.connector.desktop_size.height, 900);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(RdpOutputEvent::DisplayResizeFallback(
+                DisplayResizeFallbackReason::DisplayControlUnavailable
+            ))
+        ));
     }
 
     #[test]

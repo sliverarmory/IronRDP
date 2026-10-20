@@ -20,6 +20,12 @@ retaining existing desktop viewer feature defaults:
 - `RdpClient::with_desktop_limits` and `DecodedImage::new_bounded` enforce host
   framebuffer allocation limits before initial/reactivated allocations and
   graphics resets. EGFX's independent compositor allocation limits still apply.
+- `RdpClient::with_display_resize_reconnect(false)` makes a dynamic-resize
+  fallback terminate after reporting its reason instead of starting another
+  connection. Standalone clients retain their existing automatic fallback by
+  default. Resize completion also recognizes EGFX framebuffer size changes,
+  suppresses repeated monitor layouts, and sends scale-only updates without
+  waiting for a framebuffer change.
 - Static and dynamic channel reassembly rejects advertised or accumulated
   messages above 64 MiB before extending retained buffers. Compressed static
   fragments obey the same actual-byte ceiling. This general limit accommodates
@@ -40,6 +46,7 @@ Validation on native Apple Silicon with Rust 1.94.1:
 - `cargo test -p ironrdp-session --lib host_limit_tests`
 - `cargo test -p ironrdp-svc --lib reassembly_limit_tests`
 - `cargo test -p ironrdp-dvc --lib complete_data::tests`
+- `cargo test -p ironrdp-client --no-default-features --features rustls,clipboard-custom --lib resize_`
 
 Cross-platform GUI packaging and real-server interoperability are validated in
 Sliver GUI's own release matrix; these local checks do not certify those targets.
