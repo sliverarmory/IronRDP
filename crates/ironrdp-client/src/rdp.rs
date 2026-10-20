@@ -12,7 +12,7 @@ use std::sync::mpsc as std_mpsc;
 #[cfg(feature = "location")]
 use std::time::Instant;
 
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 pub use ironrdp_cliprdr::backend::CliprdrBackendFactory;
 use ironrdp_connector::connection_activation::ConnectionActivationState;
 use ironrdp_connector::{ConnectionResult, ConnectorResult};
@@ -49,7 +49,7 @@ use ironrdp_rdpei::RdpeiClient;
 use ironrdp_rdpei::pdu::TouchEventPdu;
 #[cfg(feature = "location")]
 use ironrdp_rdpel::client::LocationClient;
-#[cfg(any(feature = "clipboard", feature = "rdpdr"))]
+#[cfg(any(feature = "clipboard-custom", feature = "rdpdr"))]
 use ironrdp_session::ActiveStage;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{
@@ -62,13 +62,13 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-#[cfg(any(feature = "clipboard", all(windows, feature = "dvc-com-plugin")))]
+#[cfg(any(feature = "clipboard-custom", all(windows, feature = "dvc-com-plugin")))]
 use tracing::error;
 use tracing::{debug, info, trace, warn};
 
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 use crate::config::ClipboardType;
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 use ironrdp_cliprdr::backend::ClipboardMessage;
 #[cfg(all(windows, feature = "dvc-com-plugin"))]
 use ironrdp_dvc_com_plugin::load_dvc_plugin_listeners;
@@ -440,7 +440,7 @@ pub enum RdpInputEvent {
         contact_id: u8,
     },
     Close,
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     Clipboard(ClipboardMessage),
     SendDvcMessages {
         channel_id: u32,
@@ -480,7 +480,7 @@ pub const RDP_INPUT_EVENT_QUEUE_CAPACITY: usize = 128;
 pub struct RdpInputSender {
     input_sender: mpsc::Sender<RdpInputEvent>,
     #[cfg_attr(
-        not(feature = "clipboard"),
+        not(feature = "clipboard-custom"),
         expect(dead_code, reason = "clipboard input is unavailable without the clipboard feature")
     )]
     clipboard_sender: mpsc::UnboundedSender<RdpInputEvent>,
@@ -590,7 +590,7 @@ impl RdpInputSender {
     ///
     /// Clipboard messages form an ordered CLIPRDR transaction, so dropping one while applying
     /// backpressure to keyboard and pointer input can desynchronize the clipboard channel.
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     pub fn send_clipboard(&self, message: ClipboardMessage) -> Result<(), mpsc::error::SendError<RdpInputEvent>> {
         self.clipboard_sender.send(RdpInputEvent::Clipboard(message))
     }
@@ -701,7 +701,8 @@ pub struct RdpClient {
     graceful_close_receiver: watch::Receiver<bool>,
     auto_reconnect_maximum_attempts: Option<u32>,
     desktop_update_enabled: bool,
-    #[cfg(feature = "clipboard")]
+    desktop_limits: Option<(u16, u16, usize)>,
+    #[cfg(feature = "clipboard-custom")]
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
     #[cfg(feature = "rdpdr")]
     rdpdr_backend_factory: Option<Box<dyn RdpdrBackendFactory + Send>>,
@@ -726,7 +727,8 @@ impl RdpClient {
             graceful_close_receiver,
             auto_reconnect_maximum_attempts: None,
             desktop_update_enabled: false,
-            #[cfg(feature = "clipboard")]
+            desktop_limits: None,
+            #[cfg(feature = "clipboard-custom")]
             cliprdr_backend_factory: None,
             #[cfg(feature = "rdpdr")]
             rdpdr_backend_factory: None,
@@ -735,7 +737,7 @@ impl RdpClient {
 
     /// Supplies a CLIPRDR backend whose owner remains on the embedding application's event-loop
     /// thread for the lifetime of this client.
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     #[must_use]
     pub fn with_cliprdr_backend_factory(mut self, factory: Box<dyn CliprdrBackendFactory + Send>) -> Self {
         self.cliprdr_backend_factory = Some(factory);
@@ -778,6 +780,13 @@ impl RdpClient {
     #[must_use]
     pub fn with_desktop_updates(mut self) -> Self {
         self.desktop_update_enabled = true;
+        self
+    }
+
+    /// Bound initial/reactivated/EGFX desktop allocations before image buffers are created.
+    #[must_use]
+    pub fn with_desktop_limits(mut self, max_width: u16, max_height: u16, max_pixels: usize) -> Self {
+        self.desktop_limits = Some((max_width, max_height, max_pixels));
         self
     }
 
@@ -887,11 +896,19 @@ impl RdpClient {
             }
         }
 
+        // Embedders can provide a clipboard without initializing a native desktop backend.
+        #[cfg(all(feature = "clipboard-custom", not(feature = "clipboard")))]
+        let cliprdr_factory = if self.config.channels.clipboard == ClipboardType::Enable {
+            self.cliprdr_backend_factory.take()
+        } else {
+            None
+        };
+
         // Resolve the per-connection cliprdr factory reference once.  `Option<&dyn …>` is `Copy`,
         // so it can be threaded into every connect attempt across reconnects.
-        #[cfg(feature = "clipboard")]
+        #[cfg(feature = "clipboard-custom")]
         let cliprdr_factory: CliprdrFactoryRef<'_> = cliprdr_factory.as_deref();
-        #[cfg(not(feature = "clipboard"))]
+        #[cfg(not(feature = "clipboard-custom"))]
         let cliprdr_factory: CliprdrFactoryRef<'_> = core::marker::PhantomData;
         #[cfg(feature = "rdpdr")]
         let rdpdr_factory = self.rdpdr_backend_factory.take();
@@ -1130,6 +1147,7 @@ impl RdpClient {
                 self.config.rail_initial_execute.clone(),
                 &self.output_event_sender,
                 self.desktop_update_enabled,
+                self.desktop_limits,
                 &mut self.input_event_receiver,
                 &mut self.clipboard_event_receiver,
                 &mut self.close_receiver,
@@ -1352,35 +1370,35 @@ async fn send_active_output_event(
 ///
 /// Collapses to a zero-sized placeholder when the `clipboard` feature is disabled, so the
 /// connect-helper signatures don't need `#[cfg]` on this parameter.
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 type CliprdrFactoryRef<'a> = Option<&'a (dyn CliprdrBackendFactory + Send)>;
-#[cfg(not(feature = "clipboard"))]
+#[cfg(not(feature = "clipboard-custom"))]
 type CliprdrFactoryRef<'a> = core::marker::PhantomData<&'a ()>;
 #[cfg(feature = "rdpdr")]
 type RdpdrFactoryRef<'a> = Option<&'a (dyn RdpdrBackendFactory + Send)>;
 #[cfg(not(feature = "rdpdr"))]
 type RdpdrFactoryRef<'a> = core::marker::PhantomData<&'a ()>;
 
-#[cfg(all(feature = "gateway", any(feature = "clipboard", feature = "rdpdr")))]
+#[cfg(all(feature = "gateway", any(feature = "clipboard-custom", feature = "rdpdr")))]
 const HTTP_TUNNEL_REDIR_DISABLE_ALL: u32 = 0x4000_0000;
 #[cfg(all(feature = "gateway", feature = "rdpdr"))]
 const HTTP_TUNNEL_REDIR_DISABLE_DRIVE: u32 = 0x0000_0001;
-#[cfg(all(feature = "gateway", feature = "clipboard"))]
+#[cfg(all(feature = "gateway", feature = "clipboard-custom"))]
 const HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD: u32 = 0x0000_0008;
 
-#[cfg(all(feature = "gateway", any(feature = "clipboard", feature = "rdpdr")))]
+#[cfg(all(feature = "gateway", any(feature = "clipboard-custom", feature = "rdpdr")))]
 #[derive(Clone, Copy)]
 struct GatewayRedirectionPolicy {
     flags: Option<u32>,
 }
 
-#[cfg(all(feature = "gateway", any(feature = "clipboard", feature = "rdpdr")))]
+#[cfg(all(feature = "gateway", any(feature = "clipboard-custom", feature = "rdpdr")))]
 impl GatewayRedirectionPolicy {
     fn from_flags(flags: Option<u32>) -> Self {
         Self { flags }
     }
 
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     fn disables_clipboard(self) -> bool {
         self.disables(HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD)
     }
@@ -1390,12 +1408,12 @@ impl GatewayRedirectionPolicy {
         self.disables(HTTP_TUNNEL_REDIR_DISABLE_DRIVE)
     }
 
-    #[cfg(any(feature = "clipboard", feature = "rdpdr"))]
+    #[cfg(any(feature = "clipboard-custom", feature = "rdpdr"))]
     fn flags(self) -> Option<u32> {
         self.flags
     }
 
-    #[cfg(any(feature = "clipboard", feature = "rdpdr"))]
+    #[cfg(any(feature = "clipboard-custom", feature = "rdpdr"))]
     fn disables_all(self) -> bool {
         self.flags
             .is_some_and(|flags| flags & HTTP_TUNNEL_REDIR_DISABLE_ALL != 0)
@@ -1596,7 +1614,7 @@ fn build_connector(
         all(windows, feature = "webauthn")
     )))]
     let _ = input_sender;
-    #[cfg(not(feature = "clipboard"))]
+    #[cfg(not(feature = "clipboard-custom"))]
     let _ = cliprdr_factory;
     #[cfg(not(feature = "rdpdr"))]
     let _ = (rdpdr_factory, rdpdr_drives_allowed);
@@ -1932,7 +1950,7 @@ fn build_connector(
     }
 
     // Attach CLIPRDR (clipboard redirection). The backend is built fresh per connection.
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     if let Some(factory) = cliprdr_factory {
         let backend = factory.build_cliprdr_backend();
         connector.attach_static_channel(ironrdp_cliprdr::Cliprdr::new(backend));
@@ -2244,9 +2262,9 @@ async fn connect_gateway(
     .map_err(|e| ironrdp_connector::custom_err!("GW connect", e))?;
 
     let tunnel_policy = gw_stream.tunnel_policy().clone();
-    #[cfg(any(feature = "clipboard", feature = "rdpdr"))]
+    #[cfg(any(feature = "clipboard-custom", feature = "rdpdr"))]
     let gateway_redirection_policy = GatewayRedirectionPolicy::from_flags(tunnel_policy.redirection_flags);
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     let cliprdr_factory = {
         if gateway_redirection_policy.disables_clipboard() && cliprdr_factory.is_some() {
             debug!(
@@ -2283,7 +2301,7 @@ async fn connect_gateway(
     };
     #[cfg(not(feature = "rdpdr"))]
     let rdpdr_drives_allowed = true;
-    #[cfg(not(any(feature = "clipboard", feature = "rdpdr")))]
+    #[cfg(not(any(feature = "clipboard-custom", feature = "rdpdr")))]
     let _ = tunnel_policy;
 
     let framed = ironrdp_tokio::TokioFramed::new(gw_stream);
@@ -2446,7 +2464,20 @@ where
 
     let (initial_stream, leftover_bytes) = framed.into_inner();
 
-    let tls_upgrade = if let Some(callback) = config.certificate_validation_callback() {
+    #[cfg(feature = "rustls")]
+    let peer_policy = config.peer_certificate_policy.clone();
+    #[cfg(not(feature = "rustls"))]
+    let peer_policy: Option<ironrdp_tls::PeerCertificatePolicy> = None;
+
+    let tls_upgrade = if let Some(policy) = peer_policy {
+        ironrdp_tls::upgrade_with_peer_certificate_policy(
+            initial_stream,
+            config.destination.name(),
+            &config.destination.to_string(),
+            policy,
+        )
+        .await
+    } else if let Some(callback) = config.certificate_validation_callback() {
         ironrdp_tls::upgrade_with_certificate_validation_callback_for_endpoint(
             initial_stream,
             config.destination.name(),
@@ -3066,6 +3097,7 @@ async fn active_session(
     initial_rail_execute: Option<ExecutePdu>,
     output_event_sender: &crate::output_channel::OutputEventSender,
     desktop_update_enabled: bool,
+    desktop_limits: Option<(u16, u16, usize)>,
     input_event_receiver: &mut mpsc::Receiver<RdpInputEvent>,
     clipboard_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
     close_receiver: &mut watch::Receiver<bool>,
@@ -3081,7 +3113,12 @@ async fn active_session(
     let mut refresh_rect_support = connection_result.refresh_rect_support;
     let mut suppress_output_support = connection_result.suppress_output_support;
     let window_support_level = connection_result.window_support_level;
-    let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+    let mut image = DecodedImage::new_bounded(
+        PixelFormat::RgbA32,
+        desktop_size.width,
+        desktop_size.height,
+        desktop_limits,
+    )?;
     let mut desktop_update_extent = None;
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
@@ -3145,7 +3182,7 @@ async fn active_session(
             GracefulDisconnectReason::UserInitiated,
         ));
     }
-    #[cfg(not(feature = "clipboard"))]
+    #[cfg(not(feature = "clipboard-custom"))]
     let _ = clipboard_event_receiver;
 
     let disconnect_reason = 'outer: loop {
@@ -3153,11 +3190,11 @@ async fn active_session(
         let input_batch_deadline = input_batcher.deadline();
         let mut malformed_bitmap_redraw_queued = false;
         let clipboard_event = async {
-            #[cfg(feature = "clipboard")]
+            #[cfg(feature = "clipboard-custom")]
             {
                 clipboard_event_receiver.recv().await
             }
-            #[cfg(not(feature = "clipboard"))]
+            #[cfg(not(feature = "clipboard-custom"))]
             {
                 core::future::pending::<Option<RdpInputEvent>>().await
             }
@@ -3331,14 +3368,14 @@ async fn active_session(
                     }
                 }
                 clipboard_event = clipboard_event => {
-                    #[cfg(feature = "clipboard")]
+                    #[cfg(feature = "clipboard-custom")]
                     {
                         let Some(RdpInputEvent::Clipboard(event)) = clipboard_event else {
                             return Err(ironrdp_session::general_err!("clipboard event channel closed"));
                         };
                         ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
                     }
-                    #[cfg(not(feature = "clipboard"))]
+                    #[cfg(not(feature = "clipboard-custom"))]
                     {
                         let _ = clipboard_event;
                         unreachable!("clipboard receive is pending without the clipboard feature")
@@ -3453,7 +3490,7 @@ async fn active_session(
                         }
                     }
                     RdpInputEvent::Close => ActiveSessionIteration::outputs(active_stage.graceful_shutdown()?),
-                    #[cfg(feature = "clipboard")]
+                    #[cfg(feature = "clipboard-custom")]
                     RdpInputEvent::Clipboard(event) => {
                         ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
                     }
@@ -3628,7 +3665,7 @@ async fn active_session(
                 }
                 _ = cleanup_interval.tick() => {
                 // Drive clipboard lock timeout cleanup.
-                #[cfg(feature = "clipboard")]
+                #[cfg(feature = "clipboard-custom")]
                 let outputs = if let Some(cliprdr_client) = active_stage.get_svc_processor_mut::<ironrdp_cliprdr::CliprdrClient>() {
                     match cliprdr_client.drive_timeouts() {
                         Ok(svc_messages) => {
@@ -3647,7 +3684,7 @@ async fn active_session(
                 } else {
                     Vec::new()
                 };
-                #[cfg(not(feature = "clipboard"))]
+                #[cfg(not(feature = "clipboard-custom"))]
                 let outputs = Vec::new();
                 ActiveSessionIteration::outputs(outputs)
                 }
@@ -4088,7 +4125,12 @@ async fn active_session(
                         } = connection_activation.connection_activation_state()
                         {
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
-                            image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                            image = DecodedImage::new_bounded(
+                                PixelFormat::RgbA32,
+                                desktop_size.width,
+                                desktop_size.height,
+                                desktop_limits,
+                            )?;
                             desktop_update_extent = None;
                             resize_queue.completed();
                             if !active_stage.reactivate(
@@ -4380,7 +4422,7 @@ async fn active_session(
     Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
 }
 
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 fn process_clipboard_message(
     active_stage: &mut ActiveStage,
     event: ClipboardMessage,
@@ -4666,12 +4708,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     fn no_cliprdr_factory() -> CliprdrFactoryRef<'static> {
         None
     }
 
-    #[cfg(not(feature = "clipboard"))]
+    #[cfg(not(feature = "clipboard-custom"))]
     fn no_cliprdr_factory() -> CliprdrFactoryRef<'static> {
         core::marker::PhantomData
     }
@@ -4713,7 +4755,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "gateway", feature = "clipboard", feature = "rdpdr"))]
+    #[cfg(all(feature = "gateway", feature = "clipboard-custom", feature = "rdpdr"))]
     #[test]
     fn gateway_redirection_policy_interprets_flags() {
         let no_policy = GatewayRedirectionPolicy::from_flags(None);
@@ -5365,7 +5407,7 @@ mod tests {
         assert_eq!(dynamic_drive_count.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     #[test]
     fn clipboard_messages_bypass_the_bounded_input_queue() {
         let (sender, _input_receiver, mut clipboard_receiver, _, _) = RdpInputSender::channel_with_close_signal(1);

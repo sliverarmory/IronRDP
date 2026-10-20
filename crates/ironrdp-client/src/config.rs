@@ -100,6 +100,8 @@ pub struct Config {
     pub(crate) udp_offer_version: UdpVersion,
     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+    #[cfg(feature = "rustls")]
+    pub(crate) peer_certificate_policy: Option<ironrdp_tls::PeerCertificatePolicy>,
 
     #[cfg(feature = "vmconnect")]
     /// Hyper-V VM ID when connecting to a VM console (port [`ironrdp_vmconnect::PORT`]).
@@ -328,7 +330,7 @@ impl fmt::Debug for Config {
 ///
 /// Platform-specific details (e.g., which native clipboard backend to use) are handled
 /// internally by the library when [`Enable`](ClipboardType::Enable) is selected.
-#[cfg(feature = "clipboard")]
+#[cfg(feature = "clipboard-custom")]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClipboardType {
     /// Enable clipboard redirection (use the best available backend).
@@ -362,7 +364,7 @@ pub struct ChannelConfig {
     pub audio_capture: bool,
 
     /// Clipboard redirection mode.
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     pub clipboard: ClipboardType,
 
     /// Device-redirection (RDPDR) configuration.
@@ -392,7 +394,7 @@ pub struct ChannelConfig {
 #[cfg_attr(
     not(any(
         feature = "sound",
-        feature = "clipboard",
+        feature = "clipboard-custom",
         feature = "qoi",
         feature = "qoiz",
         feature = "webauthn"
@@ -409,7 +411,7 @@ impl Default for ChannelConfig {
             sound: true,
             #[cfg(feature = "sound")]
             audio_capture: false,
-            #[cfg(feature = "clipboard")]
+            #[cfg(feature = "clipboard-custom")]
             clipboard: ClipboardType::Enable,
             #[cfg(feature = "rdpdr")]
             rdpdr: RdpdrConfig::default(),
@@ -763,6 +765,9 @@ pub struct ConfigBuilder {
     enable_credssp: Option<bool>,
     certificate_validation: Option<ironrdp_tls::CertificateValidation>,
     certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+    #[cfg(feature = "rustls")]
+    peer_certificate_policy: Option<ironrdp_tls::PeerCertificatePolicy>,
+    negotiation_cookie: Option<String>,
     keyboard_type: Option<ironrdp_pdu::gcc::KeyboardType>,
     keyboard_subtype: Option<u32>,
     keyboard_functional_keys_count: Option<u32>,
@@ -1166,6 +1171,22 @@ impl ConfigBuilder {
         self
     }
 
+    /// Authorize every peer certificate, including PKI-valid certificate changes, before CredSSP.
+    #[cfg(feature = "rustls")]
+    #[must_use]
+    pub fn with_peer_certificate_policy(mut self, policy: ironrdp_tls::PeerCertificatePolicy) -> Self {
+        self.peer_certificate_policy = Some(policy);
+        self.certificate_validation = Some(ironrdp_tls::CertificateValidation::Strict);
+        self
+    }
+
+    /// Override the initial negotiation cookie so credentials need not identify the client before TLS.
+    #[must_use]
+    pub fn with_negotiation_cookie(mut self, cookie: String) -> Self {
+        self.negotiation_cookie = Some(cookie);
+        self
+    }
+
     #[must_use]
     pub fn with_server_pointer(mut self, enabled: bool) -> Self {
         self.enable_server_pointer = Some(enabled);
@@ -1466,7 +1487,7 @@ impl ConfigBuilder {
     }
 
     /// Set the CLIPRDR (clipboard) redirection mode.
-    #[cfg(feature = "clipboard")]
+    #[cfg(feature = "clipboard-custom")]
     #[must_use]
     pub fn with_clipboard(mut self, mode: ClipboardType) -> Self {
         self.channels.clipboard = mode;
@@ -1984,7 +2005,7 @@ impl ConfigBuilder {
             autologon: self.autologon.unwrap_or(false),
             enable_audio_playback: self.enable_audio_playback.unwrap_or(true),
             enable_audio_capture: self.enable_audio_capture.unwrap_or(false),
-            request_data: None,
+            request_data: self.negotiation_cookie.map(ironrdp_pdu::nego::NegoRequestData::cookie),
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
             support_dyn_vc_gfx_protocol: self.graphics_pipeline,
@@ -2026,6 +2047,8 @@ impl ConfigBuilder {
             udp_offer_version: self.udp_offer_version.unwrap_or(UdpVersion::V3),
             certificate_validation,
             certificate_validation_callback: self.certificate_validation_callback,
+            #[cfg(feature = "rustls")]
+            peer_certificate_policy: self.peer_certificate_policy,
             #[cfg(feature = "vmconnect")]
             vm_id: self.vm_id,
             #[cfg(feature = "vmconnect")]
@@ -2315,7 +2338,7 @@ impl ConfigBuilder {
         }
 
         if let Some(redirect) = ps.redirect_clipboard() {
-            #[cfg(feature = "clipboard")]
+            #[cfg(feature = "clipboard-custom")]
             {
                 self.channels.clipboard = if redirect {
                     ClipboardType::Enable

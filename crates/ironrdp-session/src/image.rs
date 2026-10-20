@@ -15,6 +15,7 @@ const TILE_SIZE: u16 = 64;
 pub struct DecodedImage {
     pixel_format: PixelFormat,
     data: Vec<u8>,
+    allocation_limits: Option<(u16, u16, usize)>,
 
     /// Part of the pointer image which should be drawn
     pointer_src_rect: InclusiveRectangle,
@@ -143,12 +144,26 @@ fn copy_cursor_data(
 }
 
 impl DecodedImage {
+    /// Construct a framebuffer only after checking the embedding application's allocation policy.
+    pub fn new_bounded(
+        pixel_format: PixelFormat,
+        width: u16,
+        height: u16,
+        limits: Option<(u16, u16, usize)>,
+    ) -> SessionResult<Self> {
+        validate_allocation(width, height, limits)?;
+        let mut image = Self::new(pixel_format, width, height);
+        image.allocation_limits = limits;
+        Ok(image)
+    }
+
     pub fn new(pixel_format: PixelFormat, width: u16, height: u16) -> Self {
         let len = usize::from(width) * usize::from(height) * usize::from(pixel_format.bytes_per_pixel());
 
         Self {
             pixel_format,
             data: vec![0; len],
+            allocation_limits: None,
             width,
             height,
 
@@ -202,6 +217,7 @@ impl DecodedImage {
 
     #[cfg_attr(feature = "__test", visibility::make(pub))]
     pub(crate) fn reset_preserving_pointer(&mut self, width: u16, height: u16) -> SessionResult<()> {
+        validate_allocation(width, height, self.allocation_limits)?;
         let len = usize::from(width)
             .checked_mul(usize::from(height))
             .and_then(|pixels| pixels.checked_mul(usize::from(self.pixel_format.bytes_per_pixel())))
@@ -1158,5 +1174,32 @@ mod tests {
             image.apply_rgb16_bitmap(&[0; 6], &encoded_rectangle, 1).is_err(),
             "oversized bitmap data must not be applied"
         );
+    }
+}
+
+fn validate_allocation(width: u16, height: u16, limits: Option<(u16, u16, usize)>) -> SessionResult<()> {
+    if let Some((max_width, max_height, max_pixels)) = limits {
+        if width == 0
+            || height == 0
+            || width > max_width
+            || height > max_height
+            || usize::from(width) * usize::from(height) > max_pixels
+        {
+            return Err(SessionError::general("desktop exceeds host allocation limit"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod host_limit_tests {
+    use super::*;
+    #[test]
+    fn refuses_initial_and_reset_allocation_before_resizing() {
+        let limits = Some((8192, 8192, 16_000_000));
+        assert!(DecodedImage::new_bounded(PixelFormat::RgbA32, 65535, 65535, limits).is_err());
+        let mut image = DecodedImage::new_bounded(PixelFormat::RgbA32, 10, 10, limits).unwrap();
+        assert!(image.reset_preserving_pointer(65535, 65535).is_err());
+        assert_eq!(image.width(), 10);
     }
 }

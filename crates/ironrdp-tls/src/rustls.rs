@@ -114,3 +114,36 @@ pub fn negotiated<S>(stream: &TlsStream<S>) -> crate::NegotiatedTls {
             .map(|suite| format!("{:?}", suite.suite())),
     }
 }
+
+/// Upgrades TLS with typed, all-certificate host authorization before CredSSP.
+pub async fn upgrade_with_peer_certificate_policy<S>(
+    stream: S,
+    server_name: &str,
+    endpoint: &str,
+    policy: crate::PeerCertificatePolicy,
+) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
+where
+    S: Unpin + AsyncRead + AsyncWrite,
+{
+    let config = crate::rustls_client_config_with_peer_policy(endpoint, policy)?;
+    let domain = ServerName::try_from(server_name.to_owned()).map_err(io::Error::other)?;
+    let mut tls_stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(domain, stream)
+        .await?;
+    tls_stream.flush().await?;
+
+    let tls_cert = {
+        use x509_cert::der::Decode as _;
+
+        let cert = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| io::Error::other("peer certificate is missing"))?;
+
+        x509_cert::Certificate::from_der(cert).map_err(io::Error::other)?
+    };
+
+    Ok((tls_stream, tls_cert))
+}

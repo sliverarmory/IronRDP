@@ -36,7 +36,9 @@ sound = [
     "ironrdp-rdpsnd-native/capture",
     "dep:ironrdp-rdpeai",
 ]
-clipboard = ["dep:ironrdp-cliprdr", "dep:ironrdp-cliprdr-native"]
+clipboard = ["clipboard-custom", "dep:ironrdp-cliprdr-native"]
+# Host-supplied CLIPRDR backend without OS clipboard/window-system dependencies.
+clipboard-custom = ["dep:ironrdp-cliprdr"]
 rdpdr = ["dep:ironrdp-rdpdr", "dep:ironrdp-rdpsnd"]
 smartcard = ["rdpdr"]
 gateway = ["dep:ironrdp-mstsgu"]

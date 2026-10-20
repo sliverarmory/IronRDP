@@ -83,3 +83,20 @@ where
 pub fn negotiated<S>(_stream: &TlsStream<S>) -> crate::NegotiatedTls {
     crate::NegotiatedTls::default()
 }
+
+/// Typed all-certificate policies require rustls.
+pub async fn upgrade_with_peer_certificate_policy<S>(
+    stream: S,
+    server_name: &str,
+    endpoint: &str,
+    policy: crate::PeerCertificatePolicy,
+) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
+where
+    S: Unpin + AsyncRead + AsyncWrite,
+{
+    let _ = (stream, server_name, endpoint, policy);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer certificate policies require rustls",
+    ))
+}

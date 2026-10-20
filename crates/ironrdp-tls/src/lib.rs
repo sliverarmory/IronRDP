@@ -41,10 +41,10 @@ compile_error!(
 #[cfg(any(feature = "stub", feature = "native-tls", feature = "rustls-no-provider"))]
 pub use impl_::{
     TlsStream, negotiated, upgrade, upgrade_with_certificate_validation, upgrade_with_certificate_validation_callback,
-    upgrade_with_certificate_validation_callback_for_endpoint,
+    upgrade_with_certificate_validation_callback_for_endpoint, upgrade_with_peer_certificate_policy,
 };
 #[cfg(feature = "rustls-verifier")]
-pub use rustls_verifier::rustls_client_config;
+pub use rustls_verifier::{rustls_client_config, rustls_client_config_with_peer_policy};
 
 /// Called when the Rustls backend cannot validate a server certificate.
 ///
@@ -57,6 +57,32 @@ pub use rustls_verifier::rustls_client_config;
 /// The `native-tls` and stub backends cannot safely support this operation and return
 /// an error if it is requested.
 pub type CertificateValidationCallback = Arc<dyn Fn(&[u8], &str, &str) -> bool + Send + Sync>;
+
+/// Structured result of platform-root/server-name verification. Only explicitly listed
+/// deployment errors may be overridden; cryptographic and unknown errors always fail closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerCertificateStatus {
+    Valid,
+    UnknownIssuer,
+    Expired,
+    NotValidYet,
+    NameMismatch,
+    HardFailure,
+}
+
+impl PeerCertificateStatus {
+    pub fn can_override(self) -> bool {
+        matches!(
+            self,
+            Self::UnknownIssuer | Self::Expired | Self::NotValidYet | Self::NameMismatch
+        )
+    }
+}
+
+/// Called on every handshake before credentials are sent. Returning false rejects even a
+/// PKI-valid certificate (for example a changed pinned certificate). Returning true cannot
+/// override HardFailure, and TLS handshake signatures are still checked independently.
+pub type PeerCertificatePolicy = Arc<dyn Fn(&[u8], &str, PeerCertificateStatus) -> bool + Send + Sync>;
 
 /// Certificate-validation policy applied during a TLS handshake.
 ///

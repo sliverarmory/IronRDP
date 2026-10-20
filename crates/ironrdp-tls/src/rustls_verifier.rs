@@ -5,7 +5,7 @@ use tokio_rustls::rustls;
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::{CertificateValidation, CertificateValidationCallback};
+use crate::{CertificateValidation, CertificateValidationCallback, PeerCertificatePolicy, PeerCertificateStatus};
 
 /// Builds the rustls client configuration used by an RDP transport.
 ///
@@ -55,10 +55,48 @@ fn server_cert_verifier(
         Some(callback) => Arc::new(CallbackVerifier {
             verifier,
             endpoint: endpoint.to_owned(),
-            callback,
+            callback: Some(callback),
+            peer_policy: None,
         }),
         None => verifier,
     })
+}
+
+/// Builds a strict verifier with a typed authorization callback for every peer certificate.
+pub fn rustls_client_config_with_peer_policy(
+    endpoint: &str,
+    policy: PeerCertificatePolicy,
+) -> io::Result<rustls::ClientConfig> {
+    let verifier = server_cert_verifier(CertificateValidation::Strict, endpoint, None)?;
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CallbackVerifier {
+            verifier,
+            endpoint: endpoint.to_owned(),
+            callback: None,
+            peer_policy: Some(policy),
+        }))
+        .with_no_client_auth();
+    // No SSLKEYLOGFILE support for the embedding path; resumption must not bypass pin decisions.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
+}
+
+fn classify_certificate_error(error: &rustls::Error) -> PeerCertificateStatus {
+    use rustls::CertificateError;
+    match error {
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer) => PeerCertificateStatus::UnknownIssuer,
+        rustls::Error::InvalidCertificate(CertificateError::Expired | CertificateError::ExpiredContext { .. }) => {
+            PeerCertificateStatus::Expired
+        }
+        rustls::Error::InvalidCertificate(
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. },
+        ) => PeerCertificateStatus::NotValidYet,
+        rustls::Error::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+        ) => PeerCertificateStatus::NameMismatch,
+        _ => PeerCertificateStatus::HardFailure,
+    }
 }
 
 fn platform_root_certificates() -> io::Result<rustls::RootCertStore> {
@@ -77,7 +115,8 @@ fn platform_root_certificates() -> io::Result<rustls::RootCertStore> {
 struct CallbackVerifier {
     verifier: Arc<dyn ServerCertVerifier>,
     endpoint: String,
-    callback: CertificateValidationCallback,
+    callback: Option<CertificateValidationCallback>,
+    peer_policy: Option<PeerCertificatePolicy>,
 }
 
 impl core::fmt::Debug for CallbackVerifier {
@@ -95,12 +134,32 @@ impl ServerCertVerifier for CallbackVerifier {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match self
+        let result = self
             .verifier
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-        {
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
+        if let Some(policy) = &self.peer_policy {
+            let status = match &result {
+                Ok(_) => PeerCertificateStatus::Valid,
+                Err(error) => classify_certificate_error(error),
+            };
+            let approved = policy(end_entity.as_ref(), &self.endpoint, status);
+            return match result {
+                Ok(verified) if approved => Ok(verified),
+                Err(_) if approved && status.can_override() => Ok(ServerCertVerified::assertion()),
+                Err(error) => Err(error),
+                Ok(_) => Err(rustls::Error::General(
+                    "peer certificate policy rejected certificate".into(),
+                )),
+            };
+        }
+        match result {
             Ok(verified) => Ok(verified),
-            Err(error) if (self.callback)(end_entity.as_ref(), &self.endpoint, &error.to_string()) => {
+            Err(error)
+                if self
+                    .callback
+                    .as_ref()
+                    .is_some_and(|callback| callback(end_entity.as_ref(), &self.endpoint, &error.to_string())) =>
+            {
                 Ok(ServerCertVerified::assertion())
             }
             Err(error) => Err(error),
@@ -179,5 +238,104 @@ impl ServerCertVerifier for NoCertificateVerification {
             rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::ED448,
         ]
+    }
+}
+
+#[cfg(test)]
+mod peer_policy_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct TestVerifier {
+        valid: bool,
+    }
+    impl ServerCertVerifier for TestVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &[rustls::pki_types::CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            if self.valid {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::BadSignature,
+                ))
+            }
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("test signature".into()))
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("test signature".into()))
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            Vec::new()
+        }
+    }
+    fn verify(verifier: &CallbackVerifier) -> Result<ServerCertVerified, rustls::Error> {
+        verifier.verify_server_cert(
+            &rustls::pki_types::CertificateDer::from(&b"test"[..]),
+            &[],
+            &ServerName::try_from("example.test").unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1)),
+        )
+    }
+    #[test]
+    fn policy_can_reject_a_pki_valid_replacement() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let verifier = CallbackVerifier {
+            verifier: Arc::new(TestVerifier { valid: true }),
+            endpoint: "example.test:3389".into(),
+            callback: None,
+            peer_policy: Some(Arc::new(move |_, _, status| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(status, PeerCertificateStatus::Valid);
+                false
+            })),
+        };
+        assert!(verify(&verifier).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn accepting_policy_cannot_override_a_bad_signature() {
+        let verifier = CallbackVerifier {
+            verifier: Arc::new(TestVerifier { valid: false }),
+            endpoint: "example.test:3389".into(),
+            callback: None,
+            peer_policy: Some(Arc::new(|_, _, status| {
+                assert_eq!(status, PeerCertificateStatus::HardFailure);
+                true
+            })),
+        };
+        assert!(verify(&verifier).is_err());
+    }
+    #[test]
+    fn classification_is_structured_and_unknown_errors_fail_closed() {
+        assert_eq!(
+            classify_certificate_error(&rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            )),
+            PeerCertificateStatus::UnknownIssuer
+        );
+        assert_eq!(
+            classify_certificate_error(&rustls::Error::General("UnknownIssuer".into())),
+            PeerCertificateStatus::HardFailure
+        );
     }
 }
