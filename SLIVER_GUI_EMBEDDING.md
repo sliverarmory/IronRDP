@@ -2,8 +2,8 @@
 
 Base: `1f69e124e6bf85608efce3495c12eaf5f6b5a95d`.
 
-This branch adds narrow embedding APIs without changing the existing desktop
-viewer defaults:
+This branch adds narrow embedding APIs and defensive reassembly limits while
+retaining existing desktop viewer feature defaults:
 
 - `ironrdp-client/clipboard-custom` enables the CLIPRDR protocol and custom
   backend factory without `ironrdp-cliprdr-native` or native window-system
@@ -20,6 +20,12 @@ viewer defaults:
 - `RdpClient::with_desktop_limits` and `DecodedImage::new_bounded` enforce host
   framebuffer allocation limits before initial/reactivated allocations and
   graphics resets. EGFX's independent compositor allocation limits still apply.
+- Static and dynamic channel reassembly rejects advertised or accumulated
+  messages above 64 MiB before extending retained buffers. Compressed static
+  fragments obey the same actual-byte ceiling. This general limit accommodates
+  an uncompressed 4K RGBA frame; backends impose tighter semantic limits (the
+  GUI's text clipboard limit is 1 MiB). Invalid dynamic fragment sequences reset
+  their retained state, and completed messages transfer their allocation.
 
 The policy callback is synchronous on the TLS handshake thread. An embedder
 must deliver its decision on a different thread with cancellation and a bounded
@@ -32,6 +38,8 @@ Validation on native Apple Silicon with Rust 1.94.1:
 - `cargo check -p ironrdp-client --no-default-features --features native-tls,clipboard`
 - `cargo test -p ironrdp-tls --no-default-features --features rustls --lib peer_policy_tests`
 - `cargo test -p ironrdp-session --lib host_limit_tests`
+- `cargo test -p ironrdp-svc --lib reassembly_limit_tests`
+- `cargo test -p ironrdp-dvc --lib complete_data::tests`
 
 Cross-platform GUI packaging and real-server interoperability are validated in
 Sliver GUI's own release matrix; these local checks do not certify those targets.

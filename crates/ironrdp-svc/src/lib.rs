@@ -332,13 +332,23 @@ struct ChunkProcessor {
     chunked_pdu: Vec<u8>,
     /// Declared total length of the current chunk sequence.
     expected_length: Option<usize>,
+    maximum_length: usize,
 }
+
+/// Maximum retained payload for one incoming static-channel message (64 MiB).
+///
+/// The wire length is a u32, but allowing its full range permits a peer to retain
+/// several GiB before a channel backend can validate the completed message.
+/// This general channel ceiling accommodates an uncompressed 4K RGBA frame;
+/// individual backends should impose lower limits appropriate to their payloads.
+pub const MAX_STATIC_CHANNEL_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 impl ChunkProcessor {
     fn new() -> Self {
         Self {
             chunked_pdu: Vec::new(),
             expected_length: None,
+            maximum_length: MAX_STATIC_CHANNEL_MESSAGE_SIZE,
         }
     }
 
@@ -374,6 +384,15 @@ impl ChunkProcessor {
         let first = header.flags.contains(ChannelControlFlags::FLAG_FIRST);
         let last = header.flags.contains(ChannelControlFlags::FLAG_LAST);
 
+        // Check both advertised uncompressed length and actual retained bytes.
+        // Compressed fragments do not obey the ordinary exact-length checks below.
+        if expected_length > self.maximum_length || chunk.len() > self.maximum_length {
+            self.clear_sequence();
+            return Err(ironrdp_core::invalid_field_err!(
+                "length", "static channel message exceeds the reassembly limit", in: cursor
+            ));
+        }
+
         if !first && !last && self.expected_length.is_none() {
             if !header.flags.contains(ChannelControlFlags::PACKET_COMPRESSED) && chunk.len() != expected_length {
                 return Err(ironrdp_core::invalid_field_err!(
@@ -406,6 +425,17 @@ impl ChunkProcessor {
             ));
         }
 
+        if self
+            .chunked_pdu
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|size| size > self.maximum_length)
+        {
+            self.clear_sequence();
+            return Err(ironrdp_core::invalid_field_err!(
+                "length", "static channel fragments exceed the reassembly limit", in: cursor
+            ));
+        }
         self.chunked_pdu.extend_from_slice(chunk);
 
         if !header.flags.contains(ChannelControlFlags::PACKET_COMPRESSED) && self.chunked_pdu.len() > expected_length {
@@ -443,7 +473,7 @@ impl ChunkProcessor {
     }
 
     fn clear_sequence(&mut self) {
-        self.chunked_pdu.clear();
+        self.chunked_pdu = Vec::new();
         self.expected_length = None;
     }
 
@@ -515,6 +545,80 @@ impl ChunkProcessor {
         }
 
         Ok(chunks)
+    }
+}
+
+#[cfg(test)]
+mod reassembly_limit_tests {
+    use super::*;
+
+    fn fragment(length: u32, flags: ChannelControlFlags, bytes: &[u8]) -> Vec<u8> {
+        let mut data = length.to_le_bytes().to_vec();
+        data.extend_from_slice(&flags.bits().to_le_bytes());
+        data.extend_from_slice(bytes);
+        data
+    }
+
+    #[test]
+    fn rejects_large_wire_length_before_retaining_payload() {
+        let mut processor = ChunkProcessor::new();
+        let payload = fragment(
+            (MAX_STATIC_CHANNEL_MESSAGE_SIZE + 1) as u32,
+            ChannelControlFlags::FLAG_FIRST,
+            &[1],
+        );
+        assert!(processor.dechunkify(&payload).is_err());
+        assert!(processor.chunked_pdu.is_empty());
+        assert!(processor.expected_length.is_none());
+    }
+
+    #[test]
+    fn compressed_fragments_cannot_bypass_actual_byte_limit() {
+        let mut processor = ChunkProcessor {
+            maximum_length: 8,
+            ..ChunkProcessor::new()
+        };
+        let flags = ChannelControlFlags::PACKET_COMPRESSED;
+        assert!(
+            processor
+                .dechunkify(&fragment(1, flags | ChannelControlFlags::FLAG_FIRST, &[0; 8]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            processor
+                .dechunkify(&fragment(1, flags | ChannelControlFlags::FLAG_LAST, &[1]))
+                .is_err()
+        );
+        assert!(processor.chunked_pdu.is_empty());
+        assert!(processor.expected_length.is_none());
+    }
+
+    #[test]
+    fn exact_limit_and_recovery_after_rejection_work() {
+        let mut processor = ChunkProcessor {
+            maximum_length: 8,
+            ..ChunkProcessor::new()
+        };
+        assert!(
+            processor
+                .dechunkify(&fragment(9, ChannelControlFlags::FLAG_FIRST, &[0]))
+                .is_err()
+        );
+        assert!(
+            processor
+                .dechunkify(&fragment(8, ChannelControlFlags::FLAG_FIRST, &[1; 4]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            processor
+                .dechunkify(&fragment(8, ChannelControlFlags::FLAG_LAST, &[2; 4]))
+                .unwrap()
+                .unwrap(),
+            [1, 1, 1, 1, 2, 2, 2, 2]
+        );
+        assert!(processor.expected_length.is_none());
     }
 }
 
